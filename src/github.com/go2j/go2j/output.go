@@ -16,6 +16,7 @@ type Output struct {
 	banStmtEnd bool
 	blockInfo  BlockInfo
 	outSource  *OutSource
+	structuralInfo *StructuralInfo
 }
 
 type InsertableOut struct {
@@ -30,6 +31,8 @@ type InsertPoint struct {
 	postEvalExpr  ast.Expr
 	postEvalIdent *ast.Ident
 	resolveOpts   *ResolveTypeOpts
+	postEvalStmt  ast.Stmt
+	postEvalStmtFn func(ast.Stmt, *Output)
 }
 
 type BlockInfo struct {
@@ -37,6 +40,12 @@ type BlockInfo struct {
 	FuncReturnTypes  map[string]ast.Expr
 	ReceiverTypeName string
 	CurrentFunctionName string
+}
+
+type StructuralInfo struct {
+	AssignmentLeft bool
+	MapAssignment bool
+	RangeStmtVars bool
 }
 
 func newInsertableOut() *InsertableOut {
@@ -47,14 +56,18 @@ func (out *Output) getFset() *token.FileSet {
 	return out.fset
 }
 
+func newResolveTypeOpts() *ResolveTypeOpts {
+	return &ResolveTypeOpts{structuralInfo: &StructuralInfo{}}
+}
+
 func (out *Output) getPosition() *InsertPoint {
-	insertPoint := &InsertPoint{out, newInsertableOut(), len([]byte(out.out.buf.String())), nil, nil, nil}
+	insertPoint := &InsertPoint{out, newInsertableOut(), len([]byte(out.out.buf.String())), nil, nil, newResolveTypeOpts(), nil, nil}
 	out.out.insertPoints = append(out.out.insertPoints, insertPoint)
 	return insertPoint
 }
 
 func (outPos *InsertPoint) getOut() *Output {
-	return &Output{outPos.insertOut, outPos.origOut.tabs, true, outPos.origOut.fset, false, outPos.origOut.blockInfo, outPos.origOut.outSource}
+	return &Output{outPos.insertOut, outPos.origOut.tabs, true, outPos.origOut.fset, false, outPos.origOut.blockInfo, outPos.origOut.outSource, outPos.origOut.structuralInfo}
 }
 
 func (outPos *InsertPoint) join() {
@@ -139,17 +152,17 @@ func (out *Output) SetOut(insertable *InsertableOut) {
 }
 
 func (out *Output) AddTab() *Output {
-	return &Output{out.out, out.tabs + 1, true, out.fset, false, out.blockInfo, out.outSource}
+	return &Output{out.out, out.tabs + 1, true, out.fset, false, out.blockInfo, out.outSource, out.structuralInfo}
 }
 
 func (out *Output) NewIndependentOutput() *Output {
-	return &Output{newInsertableOut(), 0, true, out.fset, false, out.blockInfo, out.outSource}
+	return &Output{newInsertableOut(), 0, true, out.fset, false, out.blockInfo, out.outSource, out.structuralInfo}
 }
 
 func (out *Output) BanStmtEnd() *Output {
-	return &Output{out.out, out.tabs, out.needTabs, out.fset, true, out.blockInfo, out.outSource}
+	return &Output{out.out, out.tabs, out.needTabs, out.fset, true, out.blockInfo, out.outSource, out.structuralInfo}
 }
 
 func newOutput(fset *token.FileSet, outSource *OutSource) *Output {
-	return &Output{outSource.out, 0, false, fset, false, BlockInfo{map[string]ast.Expr{}, map[string]ast.Expr{}, "", ""}, outSource}
+	return &Output{outSource.out, 0, false, fset, false, BlockInfo{map[string]ast.Expr{}, map[string]ast.Expr{}, "", ""}, outSource, &StructuralInfo{}}
 }

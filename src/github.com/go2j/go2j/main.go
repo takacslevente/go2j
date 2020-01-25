@@ -19,8 +19,8 @@ const APP_VERSION = "0.1"
 // The flag package provides a default help printer via -h switch
 var versionFlag *bool = flag.Bool("v", false, "Print the version number.")
 var printSource *bool = flag.Bool("psrc", false, "Print generated sources.")
-var goSrcDir *string = flag.String("gs", "", "Go source path. Required.")
-var javaSrcDir *string = flag.String("js", "", "Java source path. Required.")
+var goSrcDir *string = flag.String("gs", "", "Go absolute source path. Required.")
+var javaSrcDir *string = flag.String("js", "", "Java absolute source path, full. Required.")
 var goRoot = ""
 
 var oFileSet = &OutFileSet{map[string]*OutSource{}, "", map[string]*OutSource{}, map[string]*Package{}, map[string]bool{}, map[string]string{}}
@@ -63,7 +63,10 @@ type OutType struct {
 }
 
 type ResolveTypeOpts struct {
-	ElementOnly bool
+	ElementOnly         bool
+	ImplementationClass bool
+	PrimitiveAsObject   bool
+	structuralInfo      *StructuralInfo
 }
 
 func (outTypes *OutTypes) ensure(typeName string) {
@@ -222,6 +225,10 @@ func (insertPoint *InsertPoint) postEvaluate(outSource *OutSource) {
 		if typeExpr != nil {
 			out.AddVar(insertPoint.postEvalIdent.Name, typeExpr)
 		}
+	}
+	if insertPoint.postEvalStmtFn != nil {
+		out := insertPoint.getOut()
+		insertPoint.postEvalStmtFn(insertPoint.postEvalStmt, out)
 	}
 }
 
@@ -540,22 +547,25 @@ func convertFuncDecl(funcDecl *ast.FuncDecl, out *Output) {
 	//out.Println(" {")
 	if funcDecl.Body != nil {
 		out.SetCurrentFunctionName(funcDecl.Name.Name)
-		convertBlockStmt(funcDecl.Body, out)
+		convertBlockStmt(funcDecl.Body, out, nil)
 	}
 	//out.Println("}")
 }
 
-func convertBlockStmt(blockStmt *ast.BlockStmt, out *Output) {
-	convertBlockStmtTab(blockStmt, true, out)
+func convertBlockStmt(blockStmt *ast.BlockStmt, out *Output, extraDefsFn func(out *Output)) {
+	convertBlockStmtTab(blockStmt, true, out, extraDefsFn)
 }
 
-func convertBlockStmtTab(blockStmt *ast.BlockStmt, tab bool, out *Output) {
+func convertBlockStmtTab(blockStmt *ast.BlockStmt, tab bool, out *Output, extraDefsFn func(out *Output)) {
 	outList := out
 	if blockStmt.Lbrace.IsValid() {
 		out.Println(" {")
 		if tab {
 			outList = out.AddTab()
 		}
+	}
+	if extraDefsFn != nil {
+		extraDefsFn(outList)
 	}
 	for _, stmt := range blockStmt.List {
 		convertStmt(stmt, outList)
@@ -571,7 +581,7 @@ func convertStmt(stmt ast.Stmt, out *Output) {
 	case *ast.AssignStmt:
 		convertAssignStmt(tp, out)
 	case *ast.BlockStmt:
-		convertBlockStmt(tp, out)
+		convertBlockStmt(tp, out, nil)
 	case *ast.CaseClause:
 		convertCaseClause(tp, out)
 	case *ast.ExprStmt:
@@ -617,7 +627,7 @@ func convertSwitchStmt(switchStmt *ast.SwitchStmt, out *Output) {
 	out.Print("switch (")
 	convertExpr(switchStmt.Tag, out)
 	out.Print(")")
-	convertBlockStmtTab(switchStmt.Body, false, out)
+	convertBlockStmtTab(switchStmt.Body, false, out, nil)
 }
 
 func convertIncDecStmt(incDecStmt *ast.IncDecStmt, out *Output) {
@@ -683,12 +693,12 @@ func convertValueSpec(valueSpec *ast.ValueSpec, isConst bool, out *Output) {
 		out.Print("static ")
 		convertConst(isConst, out)
 		if valueSpec.Type != nil {
-			convertType(valueSpec.Type, out, nil)
+			convertType(valueSpec.Type, out, newResolveTypeOpts())
 			out.outSource.getPackage().AddVarType(name.Name, valueSpec.Type)
 			out.Print(" ")
 		} else {
 			if idx < len(valueSpec.Values) {
-				resolveType(valueSpec.Values[idx], out, nil)
+				resolveType(valueSpec.Values[idx], out, newResolveTypeOpts())
 			}
 			//TODO: iota
 			out.Print(" ")
@@ -705,7 +715,7 @@ func convertValueSpec(valueSpec *ast.ValueSpec, isConst bool, out *Output) {
 			// automatic initialization of arrays
 			case *ast.ArrayType:
 				out.Print(" = new ")
-				convertType(valueSpec.Type, out, nil)
+				convertType(valueSpec.Type, out, newResolveTypeOpts())
 				out.Print("{}")
 			}
 		}
@@ -824,7 +834,7 @@ func resolveType(expr ast.Expr, out *Output, opts *ResolveTypeOpts) ast.Expr {
 		identExpr := out.GetFuncType(funName)
 		switch tp := identExpr.(type) {
 		case *ast.Ident:
-			convertTypeIdent(tp, out)
+			convertTypeIdent(tp, out, opts)
 			return nil
 		}
 	case *ast.SelectorExpr:
@@ -864,6 +874,56 @@ func convertConst(isConst bool, out *Output) {
 	}
 }
 
+func convertRangeStmtKeyValue(rangeStmtExpr ast.Stmt, out *Output) {
+	rangeStmt := rangeStmtExpr.(*ast.RangeStmt)
+
+	newOut := out.NewIndependentOutput()
+	typeExpr := resolveType(rangeStmt.X, newOut, newResolveTypeOpts())
+	switch typeExpr.(type) {
+	case *ast.MapType:
+	default:
+		out.needTabs = false
+		if rangeStmt.Key != nil {
+			out.Print("/* ")
+			convertExpr(rangeStmt.Key, out)
+			out.Print(" */ ")
+		}
+		convertExpr(rangeStmt.Value, out)
+	}
+}
+
+func convertRangeStmtIterable(rangeStmtExpr ast.Stmt, out *Output) {
+	rangeStmt := rangeStmtExpr.(*ast.RangeStmt)
+
+	newOut := out.NewIndependentOutput()
+	typeExpr := resolveType(rangeStmt.X, newOut, newResolveTypeOpts())
+	switch typeExpr.(type) {
+	case *ast.MapType:
+		out.needTabs = false
+		out.Print(".entrySet()")
+	}
+}
+
+func convertRangeStmtExtraDefs(rangeStmtExpr ast.Stmt, out *Output) {
+	rangeStmt := rangeStmtExpr.(*ast.RangeStmt)
+
+	newOut := out.NewIndependentOutput()
+	typeExpr := resolveType(rangeStmt.X, newOut, newResolveTypeOpts())
+	switch tp := typeExpr.(type) {
+	case *ast.MapType:
+		if rangeStmt.Key != nil {
+			convertType(tp.Key, out, newResolveTypeOpts())
+			out.Print(" ")
+			convertExpr(rangeStmt.Key, out)
+			out.Println(" = entry.getKey();")
+		}
+		convertType(tp.Value, out, newResolveTypeOpts())
+		out.Print(" ")
+		convertExpr(rangeStmt.Value, out)
+		out.Println(" = entry.getValue();")
+	}
+}
+
 func convertRangeStmt(rangeStmt *ast.RangeStmt, out *Output) {
 	out.Print("for (")
 	//out.Print("Object ")
@@ -875,20 +935,27 @@ func convertRangeStmt(rangeStmt *ast.RangeStmt, out *Output) {
 		pos := out.getPosition()
 		pos.postEvalExpr = rangeStmt.X
 		pos.postEvalIdent = rangeStmt.Value.(*ast.Ident)
-		pos.resolveOpts = &ResolveTypeOpts{ElementOnly: true}
+		pos.resolveOpts.ElementOnly = true
+		pos.resolveOpts.structuralInfo.RangeStmtVars = true
 		out.Print(" ")
 	}
 
-	if rangeStmt.Key != nil {
-		out.Print("/* ")
-		convertExpr(rangeStmt.Key, out)
-		out.Print(" */ ")
-	}
-	convertExpr(rangeStmt.Value, out)
+	pos := out.getPosition()
+	pos.postEvalStmt = rangeStmt
+	pos.postEvalStmtFn = convertRangeStmtKeyValue
+
 	out.Print(" : ")
 	convertExpr(rangeStmt.X, out)
+	pos = out.getPosition()
+	pos.postEvalStmt = rangeStmt
+	pos.postEvalStmtFn = convertRangeStmtIterable
+
 	out.Print(") ")
-	convertBlockStmt(rangeStmt.Body, out)
+	convertBlockStmt(rangeStmt.Body, out, func(out *Output) {
+		pos := out.getPosition()
+		pos.postEvalStmt = rangeStmt
+		pos.postEvalStmtFn = convertRangeStmtExtraDefs
+	})
 }
 
 func convertForStmt(forStmt *ast.ForStmt, out *Output) {
@@ -905,7 +972,7 @@ func convertForStmt(forStmt *ast.ForStmt, out *Output) {
 		convertStmt(forStmt.Post, out.BanStmtEnd())
 	}
 	out.Print(") ")
-	convertBlockStmt(forStmt.Body, out)
+	convertBlockStmt(forStmt.Body, out, nil)
 }
 
 func convertIfStmt(ifStmt *ast.IfStmt, out *Output) {
@@ -916,7 +983,7 @@ func convertIfStmt(ifStmt *ast.IfStmt, out *Output) {
 	out.Print("if (")
 	convertExpr(ifStmt.Cond, out)
 	out.Print(") ")
-	convertBlockStmt(ifStmt.Body, out)
+	convertBlockStmt(ifStmt.Body, out, nil)
 	if ifStmt.Else != nil {
 		out.Print(" else ")
 		convertStmt(ifStmt.Else, out)
@@ -940,12 +1007,12 @@ func convertReturnStmt(returnStmt *ast.ReturnStmt, out *Output) {
 		}
 		if idx == 0 {
 			newOut := out.NewIndependentOutput()
-			resolveType(expr, newOut, nil)
+			resolveType(expr, newOut, newResolveTypeOpts())
 			retTypeName := newOut.out.buf.String()
 			funName := out.GetCurrentFunctionName()
 			funType := out.GetFuncType(funName)
 			newOut = out.NewIndependentOutput()
-			convertType(funType, newOut, nil)
+			convertType(funType, newOut, newResolveTypeOpts())
 			funTypeName := newOut.out.buf.String()
 			if funTypeName != retTypeName {
 				implementsIP := oTypes.getImplementsPos(retTypeName)
@@ -1000,7 +1067,9 @@ func convertAssignStmt(assignStmt *ast.AssignStmt, out *Output) {
 			if idx > 0 {
 				out.Print(" /* ")
 			}
+			out.structuralInfo.AssignmentLeft = true
 			convertExpr(expr, out)
+			out.structuralInfo.AssignmentLeft = false
 			if idx > 0 {
 				out.Print(" */")
 			}
@@ -1008,10 +1077,17 @@ func convertAssignStmt(assignStmt *ast.AssignStmt, out *Output) {
 		if isDef {
 			out.AddVar(assignStmt.Lhs[0].(*ast.Ident).Name, findType(assignStmt.Rhs[0], out))
 		}
-		out.Print(" ")
-		convertAssignToken(assignStmt.Tok, out)
-		out.Print(" ")
-		convertExpr(assignStmt.Rhs[0], out)
+		if out.structuralInfo.MapAssignment {
+			out.structuralInfo.MapAssignment = false
+			out.Print(", ")
+			convertExpr(assignStmt.Rhs[0], out)
+			out.Print(")")
+		} else {
+			out.Print(" ")
+			convertAssignToken(assignStmt.Tok, out)
+			out.Print(" ")
+			convertExpr(assignStmt.Rhs[0], out)
+		}
 	}
 	convertStmtEnd(out)
 }
@@ -1084,7 +1160,9 @@ func convertNamedExpr(expr ast.Expr, ident *ast.Ident, out *Output) {
 		out.Print(")")
 	case *ast.CompositeLit:
 		out.Print("new ")
-		convertType(tp.Type, out, nil)
+		resolveOpts := newResolveTypeOpts()
+		resolveOpts.ImplementationClass = true
+		convertType(tp.Type, out, resolveOpts)
 		out.Print("(")
 		for idx, elt := range tp.Elts {
 			if idx > 0 {
@@ -1095,14 +1173,30 @@ func convertNamedExpr(expr ast.Expr, ident *ast.Ident, out *Output) {
 		out.Print(")")
 	case *ast.IndexExpr:
 		convertExpr(tp.X, out)
-		out.Print("[")
-		convertExpr(tp.Index, out)
-		out.Print("]")
+
+		newOut := out.NewIndependentOutput()
+		iterType := resolveType(tp.X, newOut, newResolveTypeOpts())
+		switch iterType.(type) {
+		case *ast.MapType:
+			if out.structuralInfo.AssignmentLeft {
+				out.structuralInfo.MapAssignment = true
+				out.Print(".put(")
+				convertExpr(tp.Index, out)
+			} else {
+				out.Print(".get(")
+				convertExpr(tp.Index, out)
+				out.Print(")")
+			}
+		default:
+			out.Print("[")
+			convertExpr(tp.Index, out)
+			out.Print("]")
+		}
 	case *ast.KeyValueExpr:
 		convertExpr(tp.Value, out)
 	case *ast.TypeAssertExpr:
 		out.Print("((")
-		convertType(tp.Type, out, nil)
+		convertType(tp.Type, out, newResolveTypeOpts())
 		out.Print(")")
 		convertExpr(tp.X, out)
 		out.Print(")")
@@ -1174,6 +1268,32 @@ func convertIdent(tp *ast.Ident, out *Output) {
 	out.Print(name)
 }
 
+func convertStructConstructor(tp *ast.StructType, fieldList []*ast.Field, ident *ast.Ident, out *Output) {
+	out.Print("public ")
+	name := strings.Title(ident.Name)
+	out.Print(name)
+	out.Print("(")
+	for idx, field := range fieldList {
+		if idx > 0 {
+			out.Print(", ")
+		}
+		convertField(field, out.BanStmtEnd(), true)
+	}
+	out.Println(") {")
+	for _, field := range fieldList {
+		if len(field.Names) > 0 {
+			outTab := out.AddTab()
+			outTab.Print("this.")
+			outTab.Print(field.Names[0])
+			outTab.Print(" = ")
+			outTab.Print(field.Names[0])
+			convertStmtEnd(outTab)
+		}
+	}
+	out.Println("}")
+	out.Println("")
+}
+
 func convertStruct(tp *ast.StructType, ident *ast.Ident, out *Output) {
 	out.Print("public ")
 	if !ident.IsExported() {
@@ -1202,7 +1322,7 @@ func convertStruct(tp *ast.StructType, ident *ast.Ident, out *Output) {
 				} else {
 					out.Print(", ")
 				}
-				convertType(tp, out, nil)
+				convertType(tp, out, newResolveTypeOpts())
 			} else {
 				break
 			}
@@ -1214,26 +1334,32 @@ func convertStruct(tp *ast.StructType, ident *ast.Ident, out *Output) {
 
 	out.Println(" {")
 	for _, field := range tp.Fields.List {
-		convertField(field, out.AddTab())
+		convertField(field, out.AddTab(), false)
 	}
+
+	out.Println("")
+	convertStructConstructor(tp, []*ast.Field{}, ident, out.AddTab())
+	convertStructConstructor(tp, tp.Fields.List, ident, out.AddTab())
 
 	oTypes.setFunctionsPos(name, out.AddTab().getPosition())
 
 	out.Println("}")
 }
 
-func convertField(field *ast.Field, out *Output) {
+func convertField(field *ast.Field, out *Output, asParameter bool) {
 	if len(field.Names) > 0 {
-		convertExport(field.Names[0], out)
-		convertType(field.Type, out, nil)
+		if !asParameter {
+			convertExport(field.Names[0], out)
+		}
+		convertType(field.Type, out, newResolveTypeOpts())
 		out.outSource.getPackage().AddVarType(field.Names[0].Name, field.Type)
 		out.Print(" ")
 		out.Print(field.Names[0].Name)
-		if field.Type != nil {
+		if !asParameter && field.Type != nil {
 			switch field.Type.(type) {
 			case *ast.ArrayType:
 				out.Print(" = new ")
-				convertType(field.Type, out, nil)
+				convertType(field.Type, out, newResolveTypeOpts())
 				out.Print("{}")
 			}
 		}
@@ -1307,7 +1433,7 @@ func convertFuncType(tp *ast.FuncType, funcName string, isExported bool, out *Ou
 		out.Print("void ")
 	} else {
 		for idx, field := range tp.Results.List {
-			convertType(field.Type, out, nil)
+			convertType(field.Type, out, newResolveTypeOpts())
 			out.Print(" ")
 			if idx == 0 {
 				if isExported {
@@ -1330,7 +1456,7 @@ func convertFuncType(tp *ast.FuncType, funcName string, isExported bool, out *Ou
 			if idx > 0 {
 				out.Print(", ")
 			}
-			convertType(field.Type, out, nil)
+			convertType(field.Type, out, newResolveTypeOpts())
 			out.Print(" ")
 			out.Print(name.Name)
 			idx++
@@ -1354,7 +1480,7 @@ func convertTypeSelectorExpr(selectorExpr *ast.SelectorExpr, out *Output) {
 	if out.outSource.importedPackages[firstSelector] != "" {
 		convertExprSkipFirstSel(selectorExpr.X, out)
 	} else {
-		convertType(selectorExpr.X, out, nil)
+		convertType(selectorExpr.X, out, newResolveTypeOpts())
 		out.Print(".")
 	}
 	out.Print(selectorExpr.Sel.Name)
@@ -1363,11 +1489,11 @@ func convertTypeSelectorExpr(selectorExpr *ast.SelectorExpr, out *Output) {
 func convertType(fieldType ast.Expr, out *Output, opts *ResolveTypeOpts) {
 	switch tp := fieldType.(type) {
 	case *ast.Ident:
-		convertTypeIdent(tp, out)
+		convertTypeIdent(tp, out, opts)
 	case *ast.FuncType:
 		convertFuncType(tp, "", false, out)
 	case *ast.ArrayType:
-		if opts != nil && opts.ElementOnly {
+		if opts.ElementOnly {
 			opts.ElementOnly = false
 			convertType(tp.Elt, out, opts)
 		} else {
@@ -1375,11 +1501,27 @@ func convertType(fieldType ast.Expr, out *Output, opts *ResolveTypeOpts) {
 			out.Print("[]")
 		}
 	case *ast.MapType:
-		out.Print("Map<")
+		if opts.structuralInfo.RangeStmtVars {
+			out.Print("Map.Entry<")
+		} else if opts.ImplementationClass {
+			out.outSource.addSysImportName("HashMap", "java.util.HashMap")
+			out.Print("HashMap<")
+		} else {
+			out.outSource.addSysImportName("Map", "java.util.Map")
+			out.Print("Map<")
+		}
+		if opts == nil {
+			opts = &ResolveTypeOpts{PrimitiveAsObject: true}
+		} else {
+			opts.PrimitiveAsObject = true
+		}
 		convertType(tp.Key, out, opts)
 		out.Print(",")
 		convertType(tp.Value, out, opts)
 		out.Print(">")
+		if opts.structuralInfo.RangeStmtVars {
+			out.Print(" entry")
+		}
 	case *ast.StarExpr:
 		convertType(tp.X, out, opts)
 	case *ast.Ellipsis:
@@ -1411,16 +1553,32 @@ func convertType(fieldType ast.Expr, out *Output, opts *ResolveTypeOpts) {
 }
 
 var go2jType = map[string]string{
-	"string": "String",
-	"bool":   "boolean",
-	"byte":   "byte",
-	"int":    "int",
-	"int64":  "long",
+	"string":  "String",
+	"bool":    "boolean",
+	"byte":    "byte",
+	"int":     "int",
+	"int64":   "long",
+	"float32": "float",
+	"float64": "double",
 }
 
-func convertTypeIdent(tp *ast.Ident, out *Output) {
+var go2jTypeObj = map[string]string{
+	"string":  "String",
+	"bool":    "Boolean",
+	"byte":    "Byte",
+	"int":     "Integer",
+	"int64":   "Long",
+	"float32": "Float",
+	"float64": "Double",
+}
+
+func convertTypeIdent(tp *ast.Ident, out *Output, opts *ResolveTypeOpts) {
 	name := strings.Title(tp.Name)
-	if convName, has := go2jType[tp.Name]; has {
+	typeNameMap := go2jType
+	if opts.PrimitiveAsObject {
+		typeNameMap = go2jTypeObj
+	}
+	if convName, has := typeNameMap[tp.Name]; has {
 		name = convName
 	} else {
 		out.outSource.addImportedClass(name)
