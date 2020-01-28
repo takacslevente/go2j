@@ -252,9 +252,23 @@ func main() {
 
 	srcDir := *goSrcDir
 	targetDir := *javaSrcDir
-	fileList := FileList(srcDir, "")
+
+	if !strings.Contains(srcDir, "/src") {
+		fmt.Println("ERROR: -gs path must contain /src tag")
+		return
+	}
+	srcDirTags := strings.Split(srcDir, "/src")
+	addPrefix := ""
+	if len(srcDirTags) > 1 {
+		lastTag := srcDirTags[len(srcDirTags)-1]
+		if len(lastTag) > 1 {
+			addPrefix = strings.TrimPrefix(lastTag, "/") + "/"
+		}
+	}
+	
+	fileList := FileList(srcDir, "", "")
 	for _, path := range fileList {
-		convertSourceFile(path, srcDir+"/")
+		convertSourceFile(path, strings.TrimSuffix(srcDir+"/", addPrefix))
 	}
 
 	// set referenced classes to imported classes
@@ -348,7 +362,7 @@ func parseSystemImport(name string) {
 	}
 	oFileSet.sysPkgs[name] = true
 	sysSrcDir := goRoot + "/src/" + name
-	fileList := FileList(sysSrcDir, "")
+	fileList := FileList(sysSrcDir, "", "")
 	for _, path := range fileList {
 		parseSystemSourceFile(path, sysSrcDir+"/")
 	}
@@ -444,6 +458,7 @@ func convertSourceFile(absPath, trimPrefix string) {
 	packagePath := convertPackageFileName(path, file.Name.Name)
 	//fmt.Println("pkg path:", packagePath)
 	//fmt.Println("path:", path)
+
 	outSource, isNewPackage := oFileSet.newOutFile(packagePath, true, false)
 	out := newOutput(fset, outSource)
 	oFileSet.currentPackage = getPackagePath(packagePath)

@@ -7,7 +7,7 @@ import (
 	"fmt"
 )
 
-func FileList(basePath string, trimPrefix string) []string{
+func FileList(basePath, trimPrefix, addPrefix string) []string{
 	list := []string{}
 	files, _ := ioutil.ReadDir(basePath)
 	for _, afile := range files {
@@ -21,11 +21,16 @@ func FileList(basePath string, trimPrefix string) []string{
 		}
 		isFolder := stat.IsDir()
 		if isFolder {
-			list = append(list, FileList(childPath, trimPrefix)...)
+			list = append(list, FileList(childPath, trimPrefix, addPrefix)...)
 			continue
 		}
 
-		list = append(list, strings.TrimPrefix(childPath, trimPrefix))
+		if addPrefix != "" {
+			childPath = addPrefix + childPath
+		} else {
+			childPath = strings.TrimPrefix(childPath, trimPrefix)
+		} 
+		list = append(list, childPath)
 	}
 	return list
 }
