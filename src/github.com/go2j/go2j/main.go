@@ -23,7 +23,7 @@ var goSrcDir *string = flag.String("gs", "", "Go absolute source path. Required.
 var javaSrcDir *string = flag.String("js", "", "Java absolute source path, full. Required.")
 var goRoot = ""
 
-var oFileSet = &OutFileSet{map[string]*OutSource{}, "", map[string]*OutSource{}, map[string]*Package{}, map[string]bool{}, map[string]string{}}
+var oFileSet = &OutFileSet{map[string]*OutSource{}, "", map[string]*OutSource{}, map[string]*Package{}, map[string]bool{}, map[string]string{}, map[string]string{}, false}
 var oTypes = &OutTypes{map[string]*OutType{}}
 
 type OutFileSet struct {
@@ -33,6 +33,8 @@ type OutFileSet struct {
 	packageSet     map[string]*Package
 	sysPkgs        map[string]bool
 	sysImportNames map[string]string
+	typeAliases    map[string]string
+	postEvalPhase  bool
 }
 
 type OutSource struct {
@@ -60,18 +62,21 @@ type OutType struct {
 	functionsIP   *InsertPoint
 	implementsIP  *InsertPoint
 	anyImplements bool
+	implements    map[string]bool
 }
 
 type ResolveTypeOpts struct {
 	ElementOnly         bool
 	ImplementationClass bool
 	PrimitiveAsObject   bool
+	DirectEval          bool
+	FunctionAsReference bool
 	structuralInfo      *StructuralInfo
 }
 
 func (outTypes *OutTypes) ensure(typeName string) {
 	if outTypes.set[typeName] == nil {
-		outTypes.set[typeName] = &OutType{}
+		outTypes.set[typeName] = &OutType{nil, nil, false, map[string]bool{}}
 	}
 }
 
@@ -99,16 +104,23 @@ func (outTypes *OutTypes) getImplementsPos(typeName string) *InsertPoint {
 	return outTypes.set[typeName].implementsIP
 }
 
-func (outTypes *OutTypes) setAnyImplements(typeName string, anyImplements bool) {
+func (outTypes *OutTypes) addImplements(typeName, implementedTypeName string) {
 	outTypes.ensure(typeName)
-	outTypes.set[typeName].anyImplements = anyImplements
+	outTypes.set[typeName].implements[implementedTypeName] = true
 }
 
 func (outTypes *OutTypes) getAnyImplements(typeName string) bool {
 	if outTypes.set[typeName] == nil {
 		return false
 	}
-	return outTypes.set[typeName].anyImplements
+	return len(outTypes.set[typeName].implements) > 0
+}
+
+func (outTypes *OutTypes) hasImpemented(typeName, implementedTypeName string) bool {
+	if outTypes.set[typeName] == nil {
+		return false
+	}
+	return outTypes.set[typeName].implements[implementedTypeName]
 }
 
 func pathOf(path string) string {
@@ -218,17 +230,22 @@ func (insertPoint *InsertPoint) postEvaluate(outSource *OutSource) {
 	for _, subInsertPoint := range insertPoint.insertOut.insertPoints {
 		subInsertPoint.postEvaluate(outSource)
 	}
-	if insertPoint.postEvalExpr != nil {
-		out := insertPoint.getOut()
-		out.tabs = 0
-		typeExpr := resolveType(insertPoint.postEvalExpr, out, insertPoint.resolveOpts)
-		if typeExpr != nil {
-			out.AddVar(insertPoint.postEvalIdent.Name, typeExpr)
-		}
-	}
+	//	if insertPoint.postEvalExpr != nil {
+	//		out := insertPoint.getOut()
+	//		out.tabs = 0
+	//		typeExpr := resolveType(insertPoint.postEvalExpr, out, insertPoint.resolveOpts)
+	//		if typeExpr != nil {
+	//			out.AddVar(insertPoint.postEvalIdent.Name, typeExpr)
+	//		}
+	//	}
 	if insertPoint.postEvalStmtFn != nil {
 		out := insertPoint.getOut()
 		insertPoint.postEvalStmtFn(insertPoint.postEvalStmt, out)
+	}
+	if insertPoint.postEvalFn != nil {
+		out := insertPoint.getOut()
+		out.tabs = 0
+		insertPoint.postEvalFn(out)
 	}
 }
 
@@ -265,7 +282,7 @@ func main() {
 			addPrefix = strings.TrimPrefix(lastTag, "/") + "/"
 		}
 	}
-	
+
 	fileList := FileList(srcDir, "", "")
 	for _, path := range fileList {
 		convertSourceFile(path, strings.TrimSuffix(srcDir+"/", addPrefix))
@@ -280,6 +297,7 @@ func main() {
 		}
 	}
 
+	oFileSet.postEvalPhase = true
 	// resolve variable types
 	for _, outSource := range oFileSet.set {
 		for _, insertPoint := range outSource.out.insertPoints {
@@ -476,9 +494,9 @@ func convertSourceFile(absPath, trimPrefix string) {
 		pkg := newPackage(strings.Title(file.Name.Name))
 		oFileSet.packageSet[outSource.getFullPackageName()] = pkg
 		//fmt.Println("ofspkg:", outSource.getFullFileName(), strings.Title(file.Name.Name))
-
-		out = out.AddTab()
 	}
+
+	out = out.AddTab()
 
 	for _, decl := range file.Decls {
 		convertDecl(decl, out)
@@ -521,6 +539,12 @@ func convertPackageHeader(packagePath string, out *Output) {
 }
 
 func convertTypeSpec(typeSpec *ast.TypeSpec, out *Output) {
+
+	switch tp := typeSpec.Type.(type) {
+	case *ast.Ident:
+		oFileSet.typeAliases[typeSpec.Name.Name] = tp.Name
+		return
+	}
 	// TODO: convert Capital letter type to external file
 	// keep track of current file and package
 	if typeSpec.Name.IsExported() {
@@ -558,11 +582,12 @@ func convertFuncDecl(funcDecl *ast.FuncDecl, out *Output) {
 	if funcDecl.Recv == nil {
 		out.Print("static ")
 	}
-	convertFuncType(funcDecl.Type, funcDecl.Name.Name, funcDecl.Name.IsExported(), out)
+	convertFuncType(funcDecl.Type, funcDecl.Name.Name, funcDecl.Name.IsExported(), out, newResolveTypeOpts())
 	//out.Println(" {")
 	if funcDecl.Body != nil {
 		out.SetCurrentFunctionName(funcDecl.Name.Name)
 		convertBlockStmt(funcDecl.Body, out, nil)
+		out.Println("")
 	}
 	//out.Println("}")
 }
@@ -666,22 +691,38 @@ func convertDecl(decl ast.Decl, out *Output) {
 	}
 }
 
+type IotaData struct {
+	idx      int
+	active   bool
+	dataType ast.Expr
+}
+
 func convertGenDecl(decl *ast.GenDecl, out *Output) {
 	isConst := isConst(decl.Tok)
 	isImport := decl.Tok == token.IMPORT
-	needParen := decl.Lparen.IsValid() && !isImport
+	needNewLineAtTheEnd := decl.Tok == token.VAR || decl.Tok == token.CONST
+	needParen := decl.Lparen.IsValid() && !isImport && !needNewLineAtTheEnd
+	needComma := !isImport && !needNewLineAtTheEnd
 
 	if needParen {
 		out.Print("(")
 	}
+
+	iotaData := &IotaData{0, false, nil}
 	for idx, spec := range decl.Specs {
-		if idx > 0 && !isImport {
+		if needComma && idx > 0 {
 			out.Print(", ")
 		}
-		convertSpec(spec, isConst, out)
+		convertSpec(spec, isConst, out, iotaData)
+		//if needNewLine {
+		//	out.Println("")
+		//}
 	}
 	if needParen {
 		out.Print(")")
+	}
+	if needNewLineAtTheEnd {
+		out.Println("")
 	}
 }
 
@@ -689,50 +730,71 @@ func isConst(tok token.Token) bool {
 	return tok.String() == "const"
 }
 
-func convertSpec(spec ast.Spec, isConst bool, out *Output) {
+func convertSpec(spec ast.Spec, isConst bool, out *Output, iotaData *IotaData) {
 	switch tp := spec.(type) {
 	case *ast.TypeSpec:
 		convertTypeSpec(tp, out)
 	case *ast.ValueSpec:
-		convertValueSpec(tp, isConst, out)
+		convertValueSpec(tp, isConst, out, iotaData)
 		// handle import before anything else
 		//case *ast.ImportSpec:
 		//	convertImportSpec(tp, out)
 	}
 }
 
-func convertValueSpec(valueSpec *ast.ValueSpec, isConst bool, out *Output) {
+func convertValueSpec(valueSpec *ast.ValueSpec, isConst bool, out *Output, iotaData *IotaData) {
 	//printer.Fprint(os.Stdout, out.fset, valueSpec)
 	for idx, name := range valueSpec.Names {
 		convertExport(name, out)
 		out.Print("static ")
 		convertConst(isConst, out)
+		nrto := newResolveTypeOpts()
+		nrto.FunctionAsReference = true
+		var dataType ast.Expr = nil
+
 		if valueSpec.Type != nil {
-			convertType(valueSpec.Type, out, newResolveTypeOpts())
+			dataType = valueSpec.Type
+			convertType(valueSpec.Type, out, nrto)
 			out.outSource.getPackage().AddVarType(name.Name, valueSpec.Type)
 			out.Print(" ")
 		} else {
-			if idx < len(valueSpec.Values) {
-				resolveType(valueSpec.Values[idx], out, newResolveTypeOpts())
+			if iotaData.active {
+				convertType(iotaData.dataType, out, nrto)
+			} else if idx < len(valueSpec.Values) {
+				dataType = resolveType(valueSpec.Values[idx], out, nrto)
 			}
-			//TODO: iota
 			out.Print(" ")
 		}
 		convertIdent(name, out)
 		if valueSpec.Values != nil {
 			out.Print(" = ")
 			if idx < len(valueSpec.Values) {
-				convertExpr(valueSpec.Values[idx], out)
+				switch tp := valueSpec.Values[idx].(type) {
+				case *ast.Ident:
+					if tp.Name == "iota" {
+						iotaData.active = true
+						iotaData.dataType = dataType
+					}
+				}
+				if iotaData.active {
+					out.Print(iotaData.idx)
+					iotaData.idx++
+				} else {
+					convertExpr(valueSpec.Values[idx], out)
+				}
 			}
-			// TODO: iota
 		} else if valueSpec.Type != nil {
 			switch valueSpec.Type.(type) {
 			// automatic initialization of arrays
 			case *ast.ArrayType:
 				out.Print(" = new ")
-				convertType(valueSpec.Type, out, newResolveTypeOpts())
+				convertType(valueSpec.Type, out, nrto)
 				out.Print("{}")
 			}
+		} else if iotaData.active {
+			out.Print(" = ")
+			out.Print(iotaData.idx)
+			iotaData.idx++
 		}
 		convertStmtEnd(out)
 	}
@@ -811,6 +873,11 @@ func resolveType(expr ast.Expr, out *Output, opts *ResolveTypeOpts) ast.Expr {
 		}
 	case *ast.CallExpr:
 		//out.Println("funtp:", reflect.TypeOf(tp.Fun))
+		switch tp.Fun.(type) {
+		case *ast.ArrayType:
+			convertType(tp.Fun, out, newResolveTypeOpts())
+			return tp.Fun
+		}
 		funName := resolveTypeName(tp.Fun, false)
 		funNameTokens := strings.Split(funName, ".")
 		if len(funNameTokens) > 1 {
@@ -849,7 +916,14 @@ func resolveType(expr ast.Expr, out *Output, opts *ResolveTypeOpts) ast.Expr {
 		identExpr := out.GetFuncType(funName)
 		switch tp := identExpr.(type) {
 		case *ast.Ident:
-			convertTypeIdent(tp, out, opts)
+			if oFileSet.postEvalPhase {
+				convertTypeIdent(tp, out, opts)
+			} else {
+				pos := out.getPosition()
+				pos.postEvalFn = func(postOut *Output) {
+					convertTypeIdent(tp, postOut, opts)
+				}
+			}
 			return nil
 		}
 	case *ast.SelectorExpr:
@@ -948,10 +1022,20 @@ func convertRangeStmt(rangeStmt *ast.RangeStmt, out *Output) {
 	} else {
 		out.Print("")
 		pos := out.getPosition()
-		pos.postEvalExpr = rangeStmt.X
-		pos.postEvalIdent = rangeStmt.Value.(*ast.Ident)
-		pos.resolveOpts.ElementOnly = true
-		pos.resolveOpts.structuralInfo.RangeStmtVars = true
+		pos.postEvalFn = func(postOut *Output) {
+			resolveOpts := newResolveTypeOpts()
+			resolveOpts.ElementOnly = true
+			resolveOpts.structuralInfo.RangeStmtVars = true
+			typeExpr := resolveType(rangeStmt.X, postOut, resolveOpts)
+			if typeExpr != nil {
+				postOut.AddVar(rangeStmt.Value.(*ast.Ident).Name, typeExpr)
+			}
+		}
+
+		//pos.postEvalExpr = rangeStmt.X
+		//pos.postEvalIdent = rangeStmt.Value.(*ast.Ident)
+		//pos.resolveOpts.ElementOnly = true
+		//pos.resolveOpts.structuralInfo.RangeStmtVars = true
 		out.Print(" ")
 	}
 
@@ -1022,24 +1106,29 @@ func convertReturnStmt(returnStmt *ast.ReturnStmt, out *Output) {
 		}
 		if idx == 0 {
 			newOut := out.NewIndependentOutput()
-			resolveType(expr, newOut, newResolveTypeOpts())
+			nrto := newResolveTypeOpts()
+			nrto.DirectEval = true
+			resolveType(expr, newOut, nrto)
 			retTypeName := newOut.out.buf.String()
 			funName := out.GetCurrentFunctionName()
 			funType := out.GetFuncType(funName)
 			newOut = out.NewIndependentOutput()
-			convertType(funType, newOut, newResolveTypeOpts())
+			convertType(funType, newOut, nrto)
 			funTypeName := newOut.out.buf.String()
 			if funTypeName != retTypeName {
 				implementsIP := oTypes.getImplementsPos(retTypeName)
 				if implementsIP != nil {
 					outImplements := implementsIP.getOut()
 					outImplements.needTabs = false
-					if !oTypes.getAnyImplements(funTypeName) {
-						outImplements.Print(" implements ")
-					} else {
-						outImplements.Print(" ,")
+					if !oTypes.hasImpemented(retTypeName, funTypeName) {
+						if !oTypes.getAnyImplements(retTypeName) {
+							outImplements.Print(" implements ")
+							oTypes.addImplements(retTypeName, funTypeName)
+						} else {
+							outImplements.Print(", ")
+						}
+						outImplements.Print(funTypeName)
 					}
-					outImplements.Print(funTypeName)
 				}
 			}
 
@@ -1064,8 +1153,15 @@ func convertAssignStmt(assignStmt *ast.AssignStmt, out *Output) {
 		out.Print("")
 		//postpone resolving type of assignStmt.Rhs[0]
 		pos := out.getPosition()
-		pos.postEvalExpr = assignStmt.Rhs[0]
-		pos.postEvalIdent = assignStmt.Lhs[0].(*ast.Ident)
+		pos.postEvalFn = func(postOut *Output) {
+			typeExpr := resolveType(assignStmt.Rhs[0], postOut, newResolveTypeOpts())
+			if typeExpr != nil {
+				postOut.AddVar(assignStmt.Lhs[0].(*ast.Ident).Name, typeExpr)
+			}
+		}
+
+		//pos.postEvalExpr = assignStmt.Rhs[0]
+		//pos.postEvalIdent = assignStmt.Lhs[0].(*ast.Ident)
 		out.Print(" ")
 	}
 	if len(assignStmt.Lhs) > 1 && len(assignStmt.Rhs) > 1 {
@@ -1130,6 +1226,10 @@ func convertExprSkipFirstSel(expr ast.Expr, out *Output) {
 	}
 }
 
+var typeConversion = map[string]string{
+	"String->byte[]": ".getBytes()",
+}
+
 func convertNamedExpr(expr ast.Expr, ident *ast.Ident, out *Output) {
 	//out.Println("expr:", reflect.TypeOf(expr))
 	//printer.Fprint(out.out.buf, out.fset, expr)
@@ -1152,6 +1252,23 @@ func convertNamedExpr(expr ast.Expr, ident *ast.Ident, out *Output) {
 		convertBasicLit(tp, out)
 	case *ast.CallExpr:
 		funName := resolveTypeName(tp.Fun, false)
+		if len(tp.Args) == 1 {
+			iout := out.NewIndependentOutput()
+			nrto := newResolveTypeOpts()
+			nrto.DirectEval = true
+			convertType(tp.Fun, iout, nrto)
+			funConv := iout.out.buf.String()
+			iout = out.NewIndependentOutput()
+			resolveType(tp.Args[0], iout, newResolveTypeOpts())
+			arg0Type := iout.out.buf.String()
+			typeConvJava := typeConversion[arg0Type+"->"+funConv]
+			if typeConvJava != "" {
+				convertExpr(tp.Args[0], out)
+				out.Print(typeConvJava)
+				return
+			}
+		}
+
 		conv := apiConvs[funName]
 		if conv != nil {
 			out.Print(conv.method)
@@ -1255,8 +1372,21 @@ var go2jIdent = map[string]string{
 	"nil": "null",
 }
 
+func convertMultilineStringLit(value string, out *Output) {
+	value = strings.TrimPrefix(value, "`")
+	value = strings.TrimSuffix(value, "`")
+	value = strings.ReplaceAll(value, "\"", "\\\"")
+	value = strings.ReplaceAll(value, "\n", "\\n\"+\n\"")
+	value = "\"" + value + "\""
+	out.Print(value)
+}
+
 func convertBasicLit(basicLit *ast.BasicLit, out *Output) {
-	out.Print(basicLit.Value)
+	if strings.HasPrefix(basicLit.Value, "`") {
+		convertMultilineStringLit(basicLit.Value, out)
+	} else {
+		out.Print(basicLit.Value)
+	}
 }
 
 func convertUnOp(op token.Token, out *Output) {
@@ -1321,7 +1451,7 @@ func convertStruct(tp *ast.StructType, ident *ast.Ident, out *Output) {
 
 	firstIdent := true
 	secondIdent := false
-	anyImplements := false
+	//anyImplements := false
 	for _, field := range tp.Fields.List {
 		switch tp := field.Type.(type) {
 		case *ast.Ident:
@@ -1333,9 +1463,11 @@ func convertStruct(tp *ast.StructType, ident *ast.Ident, out *Output) {
 				} else if secondIdent {
 					out.Print(" implements ")
 					secondIdent = false
-					anyImplements = true
+					//anyImplements = true
+					oTypes.addImplements(name, strings.Title(tp.Name))
 				} else {
 					out.Print(", ")
+					oTypes.addImplements(name, strings.Title(tp.Name))
 				}
 				convertType(tp, out, newResolveTypeOpts())
 			} else {
@@ -1345,7 +1477,7 @@ func convertStruct(tp *ast.StructType, ident *ast.Ident, out *Output) {
 	}
 
 	oTypes.setImplementsPos(name, out.getPosition())
-	oTypes.setAnyImplements(name, anyImplements)
+	//oTypes.setAnyImplements(name, anyImplements)
 
 	out.Println(" {")
 	for _, field := range tp.Fields.List {
@@ -1354,7 +1486,9 @@ func convertStruct(tp *ast.StructType, ident *ast.Ident, out *Output) {
 
 	out.Println("")
 	convertStructConstructor(tp, []*ast.Field{}, ident, out.AddTab())
-	convertStructConstructor(tp, tp.Fields.List, ident, out.AddTab())
+	if len(tp.Fields.List) > 0 {
+		convertStructConstructor(tp, tp.Fields.List, ident, out.AddTab())
+	}
 
 	oTypes.setFunctionsPos(name, out.AddTab().getPosition())
 
@@ -1366,7 +1500,9 @@ func convertField(field *ast.Field, out *Output, asParameter bool) {
 		if !asParameter {
 			convertExport(field.Names[0], out)
 		}
-		convertType(field.Type, out, newResolveTypeOpts())
+		nrto := newResolveTypeOpts()
+		nrto.FunctionAsReference = true
+		convertType(field.Type, out, nrto)
 		out.outSource.getPackage().AddVarType(field.Names[0].Name, field.Type)
 		out.Print(" ")
 		out.Print(field.Names[0].Name)
@@ -1436,18 +1572,43 @@ func convertInterface(tp *ast.InterfaceType, ident *ast.Ident, out *Output) {
 			if len(meth.Names) > 0 {
 				funcName = meth.Names[0].Name
 			}
-			convertFuncType(tp, funcName, true, out.AddTab())
+			convertFuncType(tp, funcName, true, out.AddTab(), newResolveTypeOpts())
 			convertStmtEnd(out)
 		}
 	}
 	out.Println("}")
 }
 
-func convertFuncType(tp *ast.FuncType, funcName string, isExported bool, out *Output) {
+//Function<Event, Void> eh;
+func convertFuncTypeRef(tp *ast.FuncType, funcName string, isExported bool, out *Output) {
+	out.Print("Function<")
+	if tp.Results == nil {
+		out.Print("Void")
+	} else {
+		convertType(tp.Results.List[0].Type, out, newResolveTypeOpts())
+	}
+	out.Print(",")
+	if len(tp.Params.List) == 0 {
+		out.Print("Void")
+	} else {
+		convertType(tp.Params.List[0].Type, out, newResolveTypeOpts())
+	}
+	out.Print(">")
+	out.Print(funcName)
+	out.outSource.addSysImportName("Function", "java.util.function.Function")
+}
+
+func convertFuncType(tp *ast.FuncType, funcName string, isExported bool, out *Output, opts *ResolveTypeOpts) {
+	if opts.FunctionAsReference {
+		convertFuncTypeRef(tp, funcName, isExported, out)
+		return
+	}
+
 	if tp.Results == nil {
 		out.Print("void ")
 	} else {
 		for idx, field := range tp.Results.List {
+			out.Print("")
 			convertType(field.Type, out, newResolveTypeOpts())
 			out.Print(" ")
 			if idx == 0 {
@@ -1471,7 +1632,9 @@ func convertFuncType(tp *ast.FuncType, funcName string, isExported bool, out *Ou
 			if idx > 0 {
 				out.Print(", ")
 			}
-			convertType(field.Type, out, newResolveTypeOpts())
+			nrto := newResolveTypeOpts()
+			nrto.FunctionAsReference = true
+			convertType(field.Type, out, nrto)
 			out.Print(" ")
 			out.Print(name.Name)
 			idx++
@@ -1504,9 +1667,16 @@ func convertTypeSelectorExpr(selectorExpr *ast.SelectorExpr, out *Output) {
 func convertType(fieldType ast.Expr, out *Output, opts *ResolveTypeOpts) {
 	switch tp := fieldType.(type) {
 	case *ast.Ident:
-		convertTypeIdent(tp, out, opts)
+		if oFileSet.postEvalPhase || opts.DirectEval {
+			convertTypeIdent(tp, out, opts)
+		} else {
+			pos := out.getPosition()
+			pos.postEvalFn = func(postOut *Output) {
+				convertTypeIdent(tp, postOut, opts)
+			}
+		}
 	case *ast.FuncType:
-		convertFuncType(tp, "", false, out)
+		convertFuncType(tp, "", false, out, opts)
 	case *ast.ArrayType:
 		if opts.ElementOnly {
 			opts.ElementOnly = false
@@ -1588,15 +1758,22 @@ var go2jTypeObj = map[string]string{
 }
 
 func convertTypeIdent(tp *ast.Ident, out *Output, opts *ResolveTypeOpts) {
-	name := strings.Title(tp.Name)
+	name := tp.Name
+	titleName := strings.Title(name)
+
+	if aliasName, has := oFileSet.typeAliases[titleName]; has {
+		name = aliasName
+		titleName = strings.Title(name)
+	}
+
 	typeNameMap := go2jType
 	if opts.PrimitiveAsObject {
 		typeNameMap = go2jTypeObj
 	}
-	if convName, has := typeNameMap[tp.Name]; has {
-		name = convName
+	if convName, has := typeNameMap[name]; has {
+		titleName = convName
 	} else {
-		out.outSource.addImportedClass(name)
+		out.outSource.addImportedClass(titleName)
 	}
-	out.Print(name)
+	out.Print(titleName)
 }

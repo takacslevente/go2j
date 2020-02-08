@@ -28,11 +28,9 @@ type InsertPoint struct {
 	origOut       *Output
 	insertOut     *InsertableOut
 	pos           int
-	postEvalExpr  ast.Expr
-	postEvalIdent *ast.Ident
-	resolveOpts   *ResolveTypeOpts
 	postEvalStmt  ast.Stmt
 	postEvalStmtFn func(ast.Stmt, *Output)
+	postEvalFn func(*Output)
 }
 
 type BlockInfo struct {
@@ -61,7 +59,7 @@ func newResolveTypeOpts() *ResolveTypeOpts {
 }
 
 func (out *Output) getPosition() *InsertPoint {
-	insertPoint := &InsertPoint{out, newInsertableOut(), len([]byte(out.out.buf.String())), nil, nil, newResolveTypeOpts(), nil, nil}
+	insertPoint := &InsertPoint{out, newInsertableOut(), len([]byte(out.out.buf.String())), nil, nil, nil}
 	out.out.insertPoints = append(out.out.insertPoints, insertPoint)
 	return insertPoint
 }
